@@ -1,117 +1,235 @@
+import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
-void main() {
-  runApp(MyApp());
-}
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:background_fetch/background_fetch.dart';
 
-class MyApp extends StatelessWidget {
-  // This widget is the root of your application.
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // Try running your application with "flutter run". You'll see the
-        // application has a blue toolbar. Then, without quitting the app, try
-        // changing the primarySwatch below to Colors.green and then invoke
-        // "hot reload" (press "r" in the console where you ran "flutter run",
-        // or simply save your changes to "hot reload" in a Flutter IDE).
-        // Notice that the counter didn't reset back to zero; the application
-        // is not restarted.
-        primarySwatch: Colors.blue,
-        // This makes the visual density adapt to the platform that you run
-        // the app on. For desktop platforms, the controls will be smaller and
-        // closer together (more dense) than on mobile platforms.
-        visualDensity: VisualDensity.adaptivePlatformDensity,
-      ),
-      home: MyHomePage(title: 'Flutter Demo Home Page'),
-    );
+const EVENTS_KEY = "fetch_events";
+
+
+/// This "Headless Task" is run when app is terminated.
+void backgroundFetchHeadlessTask(String taskId) async {
+  print("[BackgroundFetch] Headless event received: $taskId");
+  DateTime timestamp = DateTime.now();
+
+  SharedPreferences prefs = await SharedPreferences.getInstance();
+
+  // Read fetch_events from SharedPreferences
+  List<String> events = [];
+  String json = prefs.getString(EVENTS_KEY);
+  if (json != null) {
+    events = jsonDecode(json).cast<String>();
+  }
+  // Add new event.
+  events.insert(0, "$taskId@$timestamp [Headless]");
+  // Persist fetch events in SharedPreferences
+  prefs.setString(EVENTS_KEY, jsonEncode(events));
+
+  BackgroundFetch.finish(taskId);
+
+  if (taskId == 'flutter_background_fetch') {
+    BackgroundFetch.scheduleTask(TaskConfig(
+        taskId: "com.transistorsoft.customtask",
+        delay: 5000,
+        periodic: false,
+        forceAlarmManager: true,
+        stopOnTerminate: false,
+        enableHeadless: true
+    ));
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  MyHomePage({Key key, this.title}) : super(key: key);
+void main() {
+  // Enable integration testing with the Flutter Driver extension.
+  // See https://flutter.io/testing/ for more info.
+  runApp(new MyApp());
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
-  @override
-  _MyHomePageState createState() => _MyHomePageState();
+  // Register to receive BackgroundFetch events after app is terminated.
+  // Requires {stopOnTerminate: false, enableHeadless: true}
+  BackgroundFetch.registerHeadlessTask(backgroundFetchHeadlessTask);
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class MyApp extends StatefulWidget {
+  @override
+  _MyAppState createState() => new _MyAppState();
+}
 
-  void _incrementCounter() {
+class _MyAppState extends State<MyApp> {
+  bool _enabled = true;
+  int _status = 0;
+  List<String> _events = [];
+
+  @override
+  void initState() {
+    super.initState();
+    initPlatformState();
+  }
+
+  // Platform messages are asynchronous, so we initialize in an async method.
+  Future<void> initPlatformState() async {
+    // Load persisted fetch events from SharedPreferences
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    String json = prefs.getString(EVENTS_KEY);
+    if (json != null) {
+      setState(() {
+        _events = jsonDecode(json).cast<String>();
+      });
+    }
+
+    // Configure BackgroundFetch.
+    BackgroundFetch.configure(BackgroundFetchConfig(
+        minimumFetchInterval: 15,
+        forceAlarmManager: false,
+        stopOnTerminate: false,
+        startOnBoot: true,
+        enableHeadless: true,
+        requiresBatteryNotLow: false,
+        requiresCharging: false,
+        requiresStorageNotLow: false,
+        requiresDeviceIdle: false,
+        requiredNetworkType: NetworkType.NONE,
+    ), _onBackgroundFetch).then((int status) {
+      print('[BackgroundFetch] configure success: $status');
+      setState(() {
+        _status = status;
+      });
+
+    }).catchError((e) {
+      print('[BackgroundFetch] configure ERROR: $e');
+      setState(() {
+        _status = e;
+      });
+    });
+
+    // Schedule a "one-shot" custom-task in 10000ms.
+    // These are fairly reliable on Android (particularly with forceAlarmManager) but not iOS,
+    // where device must be powered (and delay will be throttled by the OS).
+    BackgroundFetch.scheduleTask(TaskConfig(
+        taskId: "com.transistorsoft.customtask",
+        delay: 10000,
+        periodic: false,
+        forceAlarmManager: true,
+        stopOnTerminate: false,
+        enableHeadless: true
+    ));
+
+    // Optionally query the current BackgroundFetch status.
+    int status = await BackgroundFetch.status;
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _status = status;
+    });
+
+    // If the widget was removed from the tree while the asynchronous platform
+    // message was in flight, we want to discard the reply rather than calling
+    // setState to update our non-existent appearance.
+    if (!mounted) return;
+  }
+
+  void _onBackgroundFetch(String taskId) async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    DateTime timestamp = new DateTime.now();
+    // This is the fetch-event callback.
+    print("[BackgroundFetch] Event received: $taskId");
+    setState(() {
+      _events.insert(0, "$taskId@${timestamp.toString()}");
+    });
+    // Persist fetch events in SharedPreferences
+    prefs.setString(EVENTS_KEY, jsonEncode(_events));
+
+    if (taskId == "flutter_background_fetch") {
+      // Schedule a one-shot task when fetch event received (for testing).
+      BackgroundFetch.scheduleTask(TaskConfig(
+          taskId: "com.transistorsoft.customtask",
+          delay: 5000,
+          periodic: false,
+          forceAlarmManager: true,
+          stopOnTerminate: false,
+          enableHeadless: true
+      ));
+    }
+
+    // IMPORTANT:  You must signal completion of your fetch task or the OS can punish your app
+    // for taking too long in the background.
+    BackgroundFetch.finish(taskId);
+  }
+
+  void _onClickEnable(enabled) {
+    setState(() {
+      _enabled = enabled;
+    });
+    if (enabled) {
+      BackgroundFetch.start().then((int status) {
+        print('[BackgroundFetch] start success: $status');
+      }).catchError((e) {
+        print('[BackgroundFetch] start FAILURE: $e');
+      });
+    } else {
+      BackgroundFetch.stop().then((int status) {
+        print('[BackgroundFetch] stop success: $status');
+      });
+    }
+  }
+
+  void _onClickStatus() async {
+    int status = await BackgroundFetch.status;
+    print('[BackgroundFetch] status: $status');
+    setState(() {
+      _status = status;
     });
   }
 
+  void _onClickClear() async {
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    prefs.remove(EVENTS_KEY);
+    setState(() {
+      _events = [];
+    });
+  }
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Invoke "debug painting" (press "p" in the console, choose the
-          // "Toggle Debug Paint" action from the Flutter Inspector in Android
-          // Studio, or the "Toggle Debug Paint" command in Visual Studio Code)
-          // to see the wireframe for each widget.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            Text(
-              'You have pushed the button this many times:',
-            ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headline4,
-            ),
-          ],
+    const EMPTY_TEXT = Center(child: Text('Waiting for fetch events.  Simulate one.\n [Android] \$ ./scripts/simulate-fetch\n [iOS] XCode->Debug->Simulate Background Fetch'));
+
+    return new MaterialApp(
+      home: new Scaffold(
+        appBar: new AppBar(
+          title: const Text('BackgroundFetch Example', style: TextStyle(color: Colors.black)),
+          backgroundColor: Colors.amberAccent,
+          brightness: Brightness.light,
+          actions: <Widget>[
+            Switch(value: _enabled, onChanged: _onClickEnable),
+          ]
+        ),
+        body: (_events.isEmpty) ? EMPTY_TEXT : Container(
+          child: new ListView.builder(
+              itemCount: _events.length,
+              itemBuilder: (BuildContext context, int index) {
+                List<String> event = _events[index].split("@");
+                return InputDecorator(
+                    decoration: InputDecoration(
+                        contentPadding: EdgeInsets.only(left: 5.0, top: 5.0, bottom: 5.0),
+                        labelStyle: TextStyle(color: Colors.blue, fontSize: 20.0),
+                        labelText: "[${event[0].toString()}]"
+                    ),
+                    child: new Text(event[1], style: TextStyle(color: Colors.black, fontSize: 16.0))
+                );
+              }
+          ),
+        ),
+        bottomNavigationBar: BottomAppBar(
+          child: Container(
+            padding: EdgeInsets.only(left: 5.0, right:5.0),
+            child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: <Widget>[
+                  RaisedButton(onPressed: _onClickStatus, child: Text('Status: $_status')),
+                  RaisedButton(onPressed: _onClickClear, child: Text('Clear'))
+                ]
+            )
+          )
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
